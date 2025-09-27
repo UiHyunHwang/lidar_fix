@@ -10,20 +10,20 @@
 
 using namespace lidar_fix_params; 
 const float NaN = std::numeric_limits<float>::quiet_NaN();
-// ============================
-// (x,y) 셀 키 & 해시 (대칭 검색용)
-// ============================
+
+// (x,y) cell key
 struct CellKey {
   int i;
   int j;
   bool operator==(const CellKey& o) const { return (i == o.i) && (j == o.j); }
 };
 
+// hash function for (x,y) key
 struct CellKeyHash {
   std::size_t operator()(const CellKey& k) const noexcept {
     std::uint64_t x = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(k.i)) << 32)
                     ^ (static_cast<std::uint32_t>(k.j));
-    // 간단한 64-bit mix
+    // 64-bit mix
     x += 0x9e3779b97f4a7c15ULL;
     x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
     x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
@@ -38,16 +38,110 @@ static inline CellKey cell_of(float x, float y) {
                   static_cast<int>(std::floor(y / kXYRes)) };
 }
 // bin indexing function
-static inline int k_of(float z) {
-  int k = static_cast<int>(std::floor((z - kZMin) / kZBin));
-  if (k < 0) k = 0;
-  if (k >= kNBins) k = kNBins - 1;
-  return k;
+static inline int k_of(float z, float grnd_z) {
+  const float skip_low  = grnd_z - kSkipZone; 
+  const float skip_high = grnd_z + kSkipZone; 
+  if (z < skip_low) {
+        // 지면보다 아래
+        return static_cast<int>(std::floor((z - kZMin) / kZBin));
+    } else if (z > skip_high) {
+        // 지면보다 위: bin 인덱스를 건너뛰어야 함
+        int raw = static_cast<int>(std::floor((z - kZMin) / kZBin));
+        int skip_bins = static_cast<int>(std::ceil((skip_high - skip_low) / kZBin));
+        return raw + skip_bins; // gap 만큼 인덱스를 밀어줌
+    } else {
+        // skip zone: 이 경우 bin을 만들지 않음
+        return -1;
+    }
 }
 
-// ============================
+// +++++++++++++++++++++++++++++++++++++++
+// Added for testing, csv dump utility
+// +++++++++++++++++++++++++++++++++++++++
+#include <filesystem>
+#include <fstream>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
+#include <cstdlib>
+
+namespace {
+  namespace fs = std::filesystem;
+  static int g_frame_idx = 0; // frame counter
+
+  static inline std::string output_dir() {
+    const char* home = std::getenv("HOME");
+    std::string base = (home ? std::string(home) : std::string("")) + "/lidar_fix_2_ws/src/lidar_fix";
+    return base;
+  }
+
+  static inline std::string make_filename(int frame_idx) {
+    using clock = std::chrono::system_clock;
+    auto now = clock::now();
+    auto t   = clock::to_time_t(now);
+    auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
+
+    std::tm tm{};
+    localtime_r(&t, &tm);
+
+    std::ostringstream oss;
+    oss << "zhist_"
+        << std::setfill('0') << std::setw(4) << (tm.tm_year + 1900)
+        << std::setw(2) << (tm.tm_mon + 1)
+        << std::setw(2) << tm.tm_mday << "_"
+        << std::setw(2) << tm.tm_hour
+        << std::setw(2) << tm.tm_min
+        << std::setw(2) << tm.tm_sec
+        << "_" << frame_idx
+        << "_" << std::setw(3) << ms
+        << ".csv";
+    return oss.str();
+  }
+
+  // z_ground에 해당하는 bin(ks_ground)에는 CSV에 -1000을 기록
+  static void dump_zhist_csv_with_ground(
+    const std::unordered_map<CellKey, std::vector<uint16_t>, CellKeyHash>& zhist,
+    int ks_ground,
+    int frame_idx)
+  {
+    const std::string dir = output_dir();
+    fs::create_directories(dir);
+
+    const std::string path = dir + "/" + make_filename(frame_idx);
+    std::ofstream ofs(path, std::ios::out);
+    if (!ofs.is_open()) return;
+
+    // 헤더: i,j,bin0,bin1,...,bin{N-1}
+    ofs << "i,j";
+    for (int k = 0; k < kNBins; ++k) ofs << ",bin" << k;
+    ofs << "\n";
+
+    // 데이터 (행 수가 300을 초과하지 않도록 제한)
+    int rows_written = 0;
+    for (const auto& kv : zhist) {
+      if (rows_written >= 8000) break; // <-- 300행 제한
+
+      const CellKey& key = kv.first;
+      const std::vector<uint16_t>& hist = kv.second;
+
+      ofs << key.i << "," << key.j;
+      for (int k = 0; k < kNBins; ++k) {
+        if (k == ks_ground) {
+          ofs << "," << -1000;               // <-- z_ground에서만 -1000을 기록
+        } else {
+          ofs << "," << static_cast<unsigned int>(hist[k]);
+        }
+      }
+      ofs << "\n";
+      ++rows_written;
+    }
+    ofs.close();
+  }
+} 
+//++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
 // LidarFix Node
-// ============================
 LidarFix::LidarFix() : rclcpp::Node("lidar_fix_node")
 {
   this->declare_parameter("topic_in", "/ouster/points");
@@ -62,6 +156,9 @@ LidarFix::LidarFix() : rclcpp::Node("lidar_fix_node")
   pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(topic_out, 10);
 }
 
+//===================================================
+// Callback function
+//===================================================
 void LidarFix::lidar_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
 {
   // estimate lidar z from the ground (update for each frame)
@@ -89,9 +186,17 @@ void LidarFix::lidar_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg
       if (it == zhist.end()) { // cell index에 맞는 zhist가 없다면 : 새로 만들어서 
         it = zhist.emplace(key, std::vector<uint16_t>(kNBins, 0)).first;
       }
-      it->second[k_of(z)]++; // 해당 zhist 내에서 z index에 pcl 수 추가하기`
+      if(k_of(z, grnd_z) > 0 && k_of(z, grnd_z) < kNBins) {
+        it->second[k_of(z, grnd_z)]++; // 해당 zhist 내에서 z index에 pcl 수 추가하기`
+      }
     }
   }
+  /*
+  if (g_frame_idx == 100) {
+    const int ks_ground = k_of(grnd_z);
+    dump_zhist_csv_with_ground(zhist, ks_ground, g_frame_idx);
+  }
+  g_frame_idx++;*/
 
   // Check the existence of symmetric point if z < grnd_z
   sensor_msgs::PointCloud2Iterator<float> iter_x(modified_msg, "x");
@@ -113,11 +218,11 @@ void LidarFix::lidar_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg
       auto it = zhist.find(key);
       if (it != zhist.end()) {
         const auto& hist = it->second; 
-        const int ks = k_of(z_symm); // z*의 bin index
+        const int ks = k_of(z_symm, grnd_z); // z*의 bin index
         const int s  = ks - kTolBins; //search 범위 하한
         const int e  = ks + kTolBins; //search 범위 상한
         for (int k = s; k <= e; ++k) { // z* 근처 bin들에 실제 점이 있는지 확인
-          if (hist[k] >= 3) { // bin이 존재함
+          if (hist[k] >= 1) { // bin이 존재함
 			      mirrored = true; 
 			      break; 
 		      }

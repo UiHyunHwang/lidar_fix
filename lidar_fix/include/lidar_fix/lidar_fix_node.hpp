@@ -34,13 +34,15 @@ namespace lidar_fix_params {
 // sensor height (m)
 inline constexpr float sensor_height = 0.61f;
 
+inline constexpr float kSkipZone = 0.01f; // ±1cm → 총 2cm
+
 // (x,y) cell size [m]
-inline constexpr float kXYRes   = 0.03f;   // 3 cm
+inline constexpr float kXYRes   = 0.05f;   // 10 cm
 // z histogram range [m]
-inline constexpr float kZMin    = -(sensor_height + 3)f; // set it smaller than -(sensor height + height of the space)
-inline constexpr float kZMax    =  (3 - sensor_height)f;
+inline constexpr float kZMin    = -(sensor_height + 3.0f); // set it smaller than -(sensor height + height of the space)
+inline constexpr float kZMax    =  (3.0f - sensor_height);
 // z bin size [m]
-inline constexpr float kZBin    =  0.03f;  // 1 cm
+inline constexpr float kZBin    =  0.3f;  // 30 cm
 // number of bins
 inline constexpr int   kNBins   = static_cast<int>((kZMax - kZMin) / kZBin) + 1;
 // mirrored 판정 시 허용 bin 오차 (±kTolBins)
