@@ -31,20 +31,23 @@ namespace lidar_fix_params {
 // (x,y) cell/ z-histogram parameters
 // ============================
 
+// sensor height (m)
+inline constexpr float sensor_height = 0.61f;
+
 // (x,y) cell size [m]
 inline constexpr float kXYRes   = 0.03f;   // 3 cm
 // z histogram range [m]
-inline constexpr float kZMin    = -2.0f;
-inline constexpr float kZMax    =  2.0f;
+inline constexpr float kZMin    = -(sensor_height + 3)f; // set it smaller than -(sensor height + height of the space)
+inline constexpr float kZMax    =  (3 - sensor_height)f;
 // z bin size [m]
-inline constexpr float kZBin    =  0.01f;  // 1 cm
+inline constexpr float kZBin    =  0.03f;  // 1 cm
 // number of bins
 inline constexpr int   kNBins   = static_cast<int>((kZMax - kZMin) / kZBin) + 1;
 // mirrored 판정 시 허용 bin 오차 (±kTolBins)
-inline constexpr int   kTolBins = 0;       // ±1 cm
+inline constexpr int   kTolBins = 1;       // ±1 cm
 // ground_z 추정 시 사용할 반경 제곱 범위 [m^2] (1m ~ 3m)
 inline constexpr float kD2Min   = 1.0f;    // 1^2
-inline constexpr float kD2Max   = 2.0f;    // 3^2
+inline constexpr float kD2Max   = 9.0f;    // 3^2
 // NaN 처리 정책: 유효하지 않은 포인트나 미러 실패시 드롭할지 여부
 inline constexpr bool  kDropInvalidOrUnmirrored = true;
 } 

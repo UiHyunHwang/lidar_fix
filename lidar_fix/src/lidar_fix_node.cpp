@@ -18,6 +18,7 @@ struct CellKey {
   int j;
   bool operator==(const CellKey& o) const { return (i == o.i) && (j == o.j); }
 };
+
 struct CellKeyHash {
   std::size_t operator()(const CellKey& k) const noexcept {
     std::uint64_t x = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(k.i)) << 32)
@@ -84,11 +85,11 @@ void LidarFix::lidar_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg
       if (z < kZMin || z > kZMax) continue; 
 
       const CellKey key = cell_of(x, y);
-      auto it = zhist.find(key);
-      if (it == zhist.end()) {
+      auto it = zhist.find(key); // zhist에서 cell index에 맞는 데이터 찾기 (hash function 사용) (it->first: CellKey, it->second: zhist 벡터 )
+      if (it == zhist.end()) { // cell index에 맞는 zhist가 없다면 : 새로 만들어서 
         it = zhist.emplace(key, std::vector<uint16_t>(kNBins, 0)).first;
       }
-      it->second[k_of(z)]++;
+      it->second[k_of(z)]++; // 해당 zhist 내에서 z index에 pcl 수 추가하기`
     }
   }
 
@@ -106,17 +107,17 @@ void LidarFix::lidar_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg
     if (*iter_z < grnd_z)  // Check if z < grnd_z
     {
       const CellKey key = cell_of(*iter_x, *iter_y);
-      const float z_star = 2.f * grnd_z - (*iter_z);  // symmetric point height: z*
+      const float z_symm = 2.f * grnd_z - (*iter_z);  // symmetric point height: z*
 
       bool mirrored = false; // indicator
       auto it = zhist.find(key);
       if (it != zhist.end()) {
         const auto& hist = it->second; 
-        const int ks = k_of(z_star); // z*의 bin index
+        const int ks = k_of(z_symm); // z*의 bin index
         const int s  = ks - kTolBins; //search 범위 하한
         const int e  = ks + kTolBins; //search 범위 상한
         for (int k = s; k <= e; ++k) { // z* 근처 bin들에 실제 점이 있는지 확인
-          if (hist[k] >= 5) { // bin이 존재함
+          if (hist[k] >= 3) { // bin이 존재함
 			      mirrored = true; 
 			      break; 
 		      }
