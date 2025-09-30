@@ -44,20 +44,26 @@ private:
                           float z_max  = -0.2f);
 
   // (x,y) → cell index
-  static inline CellKey cell_of(float x, float y);
+  static CellKey cell_of(float x, float y);
 
   // z → bin index (grnd_z 기준 위/아래 분리; skip zone 영역은 skip)
-  static inline int k_of(float z, float grnd_z);
+  static int k_of(float z, float grnd_z);
 
-  // subsribe/publsih
+  // subsribe/publish
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_;
 
   /* 프레임 간 재사용하는 z-hist container (요소만 clear)
   - key: CellKey (i,j)
-  - value: 해당 cell에 속하는 point들을 z 축으로 binning한 histogram의 주소
+  - value: 해당 cell에 속하는 point들을 z 축으로 binning한 histogram
   */
   std::unordered_map<CellKey, std::vector<uint16_t>, CellKeyHash> zhist_;
+
+  /* 하부점 인덱스 컨테이너 (멤버로 승격: 매 프레임 clear 후 재사용)
+  - key: CellKey (i,j)
+  - value: 이 셀에 속한 z<grnd_z 포인트들의 point index 목록
+  */
+  std::unordered_map<CellKey, std::vector<uint32_t>, CellKeyHash> below_map_;
 
   // zhist 초기 버킷 수(성능용)
   static constexpr std::size_t kInitBuckets = 8192;
@@ -79,7 +85,7 @@ namespace lidar_fix_params {
   inline constexpr float kZMax    =  (3.0f - sensor_height);
 
   // z bin size [m]
-  inline constexpr float kZBin    =  0.5f;  // 50 cm
+  inline constexpr float kZBin    =  0.5f;  // 30 cm
 
   // number of bins
   inline constexpr int   kNBins   = static_cast<int>((kZMax - kZMin) / kZBin) + 1;
