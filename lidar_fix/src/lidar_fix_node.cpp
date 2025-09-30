@@ -23,16 +23,19 @@ inline CellKey LidarFix::cell_of(float x, float y) {
 // bin indexing function, skipt the bin around ground_z
 int LidarFix::k_of(float z, float grnd_z) {
   if (z < kZMin || z > kZMax) return -1;
+
   const float skip_low  = grnd_z - kSkipZone; 
   const float skip_high = grnd_z + kSkipZone; 
 
-  if (z > skip_high) { // 지면보다 위: bin 인덱스를 건너뛰어야 함
+  if (z > skip_high) {    
+    // 지면보다 위: bin 인덱스를 건너뛰어야 함
       const int raw = static_cast<int>(std::floor((z - kZMin) / kZBin));
-      const int skip_bins = std::max(1, static_cast<int>(std::ceil((skip_high - skip_low) / kZBin)));
-      return raw + skip_bins; // gap 만큼 인덱스를 밀어줌
-  } else if (z < skip_low) {           // 지면보다 아래
+      return raw + 1;     // gap에 해당하는 index를 건너뜀
+  } else if (z < skip_low) {           
+    // 지면보다 아래
     return static_cast<int>(std::floor((z - kZMin) / kZBin));
-  } else {                    // skip zone: 무시함
+  } else {                
+    // skip zone: 무시함
     return -1;
   }
 }
@@ -53,7 +56,7 @@ LidarFix::LidarFix() : rclcpp::Node("lidar_fix_node")
   pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(topic_out, 10);
 
   zhist_.max_load_factor(0.7f);
-  zhist_.rehash(kInitBuckets);
+  zhist_.rehash(kInitBuckets); // kInitBuckets = 8192
 }
 
 //===================================================
@@ -78,7 +81,6 @@ void LidarFix::lidar_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg
     for (; ix != ix.end(); ++ix, ++iy, ++iz) {
       const float x = *ix, y = *iy, z = *iz;
       if (!std::isfinite(z)) continue;
-      if (z < kZMin || z > kZMax) continue; 
 
       const int k = k_of(z, grnd_z);
       if (k < 0 || k  >= kNBins) continue;
@@ -99,7 +101,7 @@ void LidarFix::lidar_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg
 
   for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z){
     if (!std::isfinite(*iter_z)) {
-		  if (kDropInvalidOrUnmirrored) { *iter_x = NaN; *iter_y = NaN; *iter_z = NaN; }
+		  *iter_x = NaN; *iter_y = NaN; *iter_z = NaN;
     	continue;
     }
     

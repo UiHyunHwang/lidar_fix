@@ -49,11 +49,14 @@ private:
   // z → bin index (grnd_z 기준 위/아래 분리; skip zone 영역은 skip)
   static inline int k_of(float z, float grnd_z);
 
-  // 구독/퍼블리시
+  // subsribe/publsih
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_;
 
-  // 프레임 간 재사용하는 z-hist (요소만 clear)
+  /* 프레임 간 재사용하는 z-hist container (요소만 clear)
+  - key: CellKey (i,j)
+  - value: 해당 cell에 속하는 point들을 z 축으로 binning한 histogram의 주소
+  */
   std::unordered_map<CellKey, std::vector<uint16_t>, CellKeyHash> zhist_;
 
   // zhist 초기 버킷 수(성능용)
@@ -62,6 +65,7 @@ private:
 
 // namespace lidar_fix_params
 namespace lidar_fix_params {
+
   // sensor height (m)
   inline constexpr float sensor_height = 0.32f;
 
@@ -75,7 +79,7 @@ namespace lidar_fix_params {
   inline constexpr float kZMax    =  (3.0f - sensor_height);
 
   // z bin size [m]
-  inline constexpr float kZBin    =  0.5f;  // 30 cm
+  inline constexpr float kZBin    =  0.5f;  // 50 cm
 
   // number of bins
   inline constexpr int   kNBins   = static_cast<int>((kZMax - kZMin) / kZBin) + 1;
@@ -86,7 +90,4 @@ namespace lidar_fix_params {
   // ground_z 추정 시 사용할 반경 제곱 범위 [m^2] (1m ~ 3m)
   inline constexpr float kD2Min   = 1.0f;    // 1^2
   inline constexpr float kD2Max   = 9.0f;    // 3^2
-
-  // NaN 처리 정책: 유효하지 않은 포인트나 미러 실패시 드롭할지 여부
-  inline constexpr bool  kDropInvalidOrUnmirrored = true;
 }
