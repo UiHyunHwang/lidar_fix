@@ -20,10 +20,12 @@ cmake_policy(SET CMP0074 NEW)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(OpenCV REQUIRED) 
 
 set(dependencies
     rclcpp
     sensor_msgs
+    ${OpenCV_INCLUDE_DIRS}  
 )
 
 include_directories(
@@ -32,6 +34,7 @@ include_directories(
 
 add_executable(lidar_fix_node src/lidar_fix_node.cpp src/lidar_fix_main.cpp)
 ament_target_dependencies(lidar_fix_node ${dependencies})
+target_link_libraries(lidar_fix_node ${OpenCV_LIBS}) 
 
 target_include_directories(lidar_fix_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

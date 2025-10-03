@@ -1,169 +1,249 @@
 #include "lidar_fix/lidar_fix_node.hpp"
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 
-#include <unordered_map>
-#include <vector>
-#include <cmath>
-#include <cstdint>
 #include <algorithm>
 #include <limits>
 
-using namespace lidar_fix_params; 
+using namespace lidar_fix_params;
 
 namespace {
   const float NaN = std::numeric_limits<float>::quiet_NaN();
-  static int g_frame_idx = 0;
 }
 
-// cell indexing function
-inline CellKey LidarFix::cell_of(float x, float y) {
-  return CellKey{ static_cast<int>(std::floor(x / kXYRes)),
-                  static_cast<int>(std::floor(y / kXYRes)) };
-}
-// bin indexing function, skipt the bin around ground_z
-int LidarFix::k_of(float z, float grnd_z) {
-  if (z < kZMin || z > kZMax) return -1;
-
-  const float skip_low  = grnd_z - kSkipZone; 
-  const float skip_high = grnd_z + kSkipZone; 
-
-  if (z > skip_high) {    
-    // 지면보다 위: bin 인덱스를 건너뛰어야 함
-      const int raw = static_cast<int>(std::floor((z - kZMin) / kZBin));
-      return raw + 1;     // gap에 해당하는 index를 건너뜀
-  } else if (z < skip_low) {           
-    // 지면보다 아래
-    return static_cast<int>(std::floor((z - kZMin) / kZBin));
-  } else {                
-    // skip zone: 무시함
-    return -1;
-  }
-}
-
-
-// LidarFix Node
+// --------------------------------------------------
+// LidarFix Nodel
+// --------------------------------------------------
 LidarFix::LidarFix() : rclcpp::Node("lidar_fix_node")
 {
-  this->declare_parameter("topic_in", "/ouster/points");
-  this->declare_parameter("topic_out", "/ouster/points/fix");
+  this->declare_parameter<std::string>("topic_in",  "/ouster/points");
+  this->declare_parameter<std::string>("topic_out", "/ouster/points/fix");
 
-  const std::string topic_in  = this->get_parameter("topic_in").as_string();
-  const std::string topic_out = this->get_parameter("topic_out").as_string();
-  
+  const auto topic_in  = this->get_parameter("topic_in").as_string();
+  const auto topic_out = this->get_parameter("topic_out").as_string();
+
   sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-      topic_in, rclcpp::SensorDataQoS(),
-      std::bind(&LidarFix::lidar_callback, this, std::placeholders::_1));
-  pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(topic_out, 10);
+    topic_in, rclcpp::SensorDataQoS(),
+    std::bind(&LidarFix::lidar_callback, this, std::placeholders::_1));
 
-  zhist_.max_load_factor(0.7f);
-  zhist_.rehash(kInitBuckets); // kInitBuckets = 8192
+  pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(topic_out, 10);
 }
 
-//===================================================
-// Callback function
-//===================================================
+// --------------------------------------------------
+// helpers: azimuth/elevation → (ix, iy)
+// --------------------------------------------------
+int LidarFix::az_to_ix(float az) const {
+  // az ∈ [-pi, pi] → [0, kCols-1]
+  float u = (az + static_cast<float>(M_PI)) / (2.0f * static_cast<float>(M_PI));
+  int ix = static_cast<int>(std::floor(u * static_cast<float>(kCols)));
+  if (ix < 0) ix = 0;
+  if (ix >= kCols) ix = kCols - 1;
+  return ix;
+}
+int LidarFix::el_to_iy(float el) const {
+  // el ∈ [elMin, elMax] → [0, kRings-1]
+  float u = (el - elMin) / (elMax - elMin);
+  int iy = static_cast<int>(std::round(u * static_cast<float>(kRings - 1)));
+  if (iy < 0) iy = 0;
+  if (iy >= kRings) iy = kRings - 1;
+  return iy;
+}
+
+// --------------------------------------------------
+// range image formulation (fixed size: 64 x 1024)
+// --------------------------------------------------
+void LidarFix::init_index_and_radius(const sensor_msgs::msg::PointCloud2& cloud,
+                                     cv::Mat& index,
+                                     std::vector<float>& r_h,
+                                     std::vector<float>& az,
+                                     std::vector<float>& el)
+{
+  const int H = kRings, W = kCols; // (64, 1024)
+  index = cv::Mat(H, W, CV_32SC1, cv::Scalar(-1));
+
+  const size_t N = static_cast<size_t>(cloud.width) * static_cast<size_t>(cloud.height);
+  r_h.assign(N, -1.f);
+  az .assign(N,  0.f);
+  el .assign(N,  0.f);
+
+  // field offsets
+  size_t off_x = 0, off_y = 0, off_z = 0;
+  for (const auto& f : cloud.fields) {
+    if      (f.name == "x") off_x = f.offset;
+    else if (f.name == "y") off_y = f.offset;
+    else if (f.name == "z") off_z = f.offset;
+  }
+  const uint8_t* base = cloud.data.data();
+  const uint32_t step = cloud.point_step;
+  const size_t   all  = cloud.data.size();
+
+  size_t i = 0;
+  for (size_t off = 0; off + step <= all; off += step, ++i) {
+    const float x = *reinterpret_cast<const float*>(base + off + off_x);
+    const float y = *reinterpret_cast<const float*>(base + off + off_y);
+    const float z = *reinterpret_cast<const float*>(base + off + off_z);
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+
+    const float rh  = std::hypot(x, y);
+    const float azv = std::atan2(y, x);   // [-pi, pi]
+    const float elv = std::atan2(z, rh);  // elevation
+
+    if (i < r_h.size()) {
+      r_h[i] = rh;
+      az [i] = pan;
+      el [i] = elv;
+    }
+
+    // 수직 FOV 밖은 스킵
+    if (elv < elMin || elv > elMax) continue;
+
+    int iy = static_cast<int>(i / static_cast<size_t>(W));
+    if (iy < 0 || iy >= H) continue;
+
+    float u = (1.0f - (pan / static_cast<float>(M_PI))) * 0.5f; 
+    int ix = static_cast<int>(std::floor(u * static_cast<float>(W)));
+    if (ix < 0)   ix = 0;
+    if (ix >= W)  ix = W - 1;
+
+    index.at<int>(iy, ix) = static_cast<int>(i);
+  }
+}
+
+// --------------------------------------------------
+// main callback: symmetric-point check + restore
+// --------------------------------------------------
 void LidarFix::lidar_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
 {
-  // Start the frame by clearing out the elements of bucket
-  zhist_.clear(); 
+  // 0) ground z 추정
+  const float ground_z = estimate_ground_z(msg, kGrndBinSz, kGrndZMin, kGrndZMax);
 
-  // estimate lidar z from the ground (update for each frame)
-  const float grnd_z = estimate_ground_z(msg); 
+  // 1) range image (index, r_h, az, el)
+  cv::Mat index;
+  std::vector<float> r_h, az, el;
+  init_index_and_radius(*msg, index, r_h, az, el);
 
-  // create copy
-  auto modified_msg = *msg;
+  // 2) 출력 메시지 준비(원본 복사)
+  auto out = *msg;
 
-  {
-    sensor_msgs::PointCloud2ConstIterator<float> ix(*msg, "x");
-    sensor_msgs::PointCloud2ConstIterator<float> iy(*msg, "y");
-    sensor_msgs::PointCloud2ConstIterator<float> iz(*msg, "z");
+  // field offsets
+  const uint32_t step = out.point_step;
+  size_t off_x = 0, off_y = 0, off_z = 0;
+  for (const auto& f : out.fields) {
+    if      (f.name == "x") off_x = f.offset;
+    else if (f.name == "y") off_y = f.offset;
+    else if (f.name == "z") off_z = f.offset;
+  }
 
-    for (; ix != ix.end(); ++ix, ++iy, ++iz) {
-      const float x = *ix, y = *iy, z = *iz;
-      if (!std::isfinite(z)) continue;
+  uint8_t*       db  = out.data.data();
+  const uint8_t* sb  = msg->data.data();
+  const size_t   all = out.data.size();
 
-      const int k = k_of(z, grnd_z);
-      if (k < 0 || k  >= kNBins) continue;
+  // skip zone around ground
+  const float skip_low  = ground_z - kSkipZone;
+  const float skip_high = ground_z + kSkipZone;
 
-      const CellKey key = cell_of(x, y);
-      auto it = zhist_.find(key); // zhist에서 cell index에 맞는 데이터 찾기 (hash function 사용) (it->first: CellKey, it->second: zhist 벡터 )
-      if (it == zhist_.end()) { // cell index에 맞는 zhist가 없다면 : 새로 만들어서 
-        it = zhist_.emplace(key, std::vector<uint16_t>(kNBins, 0)).first;
+  auto dz_thr = [&](float r){ return kDzBase + kDzPerMeter * r; };
+  auto dr_thr = [&](float r){ return kDrBase + kDrPerMeter * r; };
+
+  // 3) 전체 포인트 순회
+  size_t i = 0;
+  for (size_t off = 0; off + step <= all; off += step, ++i) {
+    float& X = *reinterpret_cast<float*>(db + off + off_x);
+    float& Y = *reinterpret_cast<float*>(db + off + off_y);
+    float& Z = *reinterpret_cast<float*>(db + off + off_z);
+
+    const float x = *reinterpret_cast<const float*>(sb + off + off_x);
+    const float y = *reinterpret_cast<const float*>(sb + off + off_y);
+    const float z = *reinterpret_cast<const float*>(sb + off + off_z);
+
+    // invalid → NaN
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+      X = Y = Z = NaN; continue;
+    }
+
+    // skip zone 안/위는 그대로 통과
+    if (!(z < skip_low)) { X = x; Y = y; Z = z; continue; }
+
+    // 현재 포인트의 기본량
+    const float rh  = (i < r_h.size()) ? r_h[i] : -1.f;
+    const float azv = (i < az.size())  ? az[i]  :  0.f;
+    if (rh < 0.f) { X = x; Y = y; Z = z; continue; } // range image 매핑 실패
+
+    // 목표 대칭 z
+    const float z_sym = 2.f * ground_z - z;
+
+    // 목표 고도각/인덱스
+    const float el_sym = std::atan2(z_sym, rh);
+    int ix = az_to_ix(azv);
+    int iy = el_to_iy(el_sym);
+
+    // 3×3 근방 탐색
+    const int xs = std::max(0, ix - kAzTol);
+    const int xe = std::min(kCols - 1, ix + kAzTol);
+    const int ys = std::max(0, iy - kRingTol);
+    const int ye = std::min(kRings - 1, iy + kRingTol);
+
+    bool mirrored = false;
+    float bestCost = 1e9f;
+
+    for (int cx = xs; cx <= xe; ++cx) {
+      for (int cy = ys; cy <= ye; ++cy) {
+        int k = index.at<int>(cy, cx);
+        if (k < 0) continue;
+
+        const size_t offk = static_cast<size_t>(k) * step;
+        if (offk + step > all) continue;
+
+        const float qx = *reinterpret_cast<const float*>(sb + offk + off_x);
+        const float qy = *reinterpret_cast<const float*>(sb + offk + off_y);
+        const float qz = *reinterpret_cast<const float*>(sb + offk + off_z);
+        if (!std::isfinite(qx) || !std::isfinite(qy) || !std::isfinite(qz)) continue;
+
+        const float rh_q = std::hypot(qx, qy);
+        const float dz   = std::fabs(qz - z_sym);
+        const float dr   = std::fabs(rh_q - rh);
+
+        if (dz <= dz_thr(rh) && dr <= dr_thr(rh)) {
+          const float cost = dz + dr;
+          if (cost < bestCost) { bestCost = cost; mirrored = true; }
+        }
       }
-      it->second[k]++; // 해당 zhist 내에서 z index에 pcl 수 추가하기`
+    }
+
+    if (mirrored) {
+      // 복원: 원점 방사 스케일로 z=ground_z
+      const float ratio = (z == 0.f) ? 1.f : (ground_z / z);
+      X = x * ratio;
+      Y = y * ratio;
+      Z = ground_z;
+    } else {
+      // 미복원
+      X = x; Y = y; Z = z;
     }
   }
 
-  // Check the existence of symmetric point if z < grnd_z
-  sensor_msgs::PointCloud2Iterator<float> iter_x(modified_msg, "x");
-  sensor_msgs::PointCloud2Iterator<float> iter_y(modified_msg, "y");
-  sensor_msgs::PointCloud2Iterator<float> iter_z(modified_msg, "z");
-
-  for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z){
-    if (!std::isfinite(*iter_z)) {
-		  *iter_x = NaN; *iter_y = NaN; *iter_z = NaN;
-    	continue;
-    }
-    
-    if (*iter_z < grnd_z)  // Check if z < grnd_z
-    {
-      const CellKey key = cell_of(*iter_x, *iter_y);
-      const float z_symm = 2.f * grnd_z - (*iter_z);  // symmetric point height: z*
-
-      bool mirrored = false; // indicator
-      auto it = zhist_.find(key);
-      if (it != zhist_.end()) {
-        const auto& hist = it->second; 
-        const int ks = k_of(z_symm, grnd_z); // z*의 bin index
-        if (ks >= 0 && ks < kNBins) {
-          const int s = std::max(0, ks - kTolBins);
-          const int e = std::min(kNBins - 1, ks + kTolBins);
-          for (int k = s; k <= e; ++k) {
-            if (hist[k] >= 1) { mirrored = true; break; }
-          }
-        }       
-      }
-
-      if (mirrored) { // If symmetric point exists -> fix (x, y, z)
-        const float ratio = grnd_z / (*iter_z);
-        *iter_x *= ratio;
-        *iter_y *= ratio;
-        *iter_z = grnd_z;
-      }
-    }
-  }
-
-  // publish modified msg
-  pub_->publish(modified_msg);
-
-  if (g_frame_idx == 100) {
-    RCLCPP_INFO(this->get_logger(), "Frame %d: total cells = %zu",
-              g_frame_idx, zhist_.size());
-  }
-  ++g_frame_idx;
+  pub_->publish(out);
 }
 
-// ============================
-// Estimate ground z
-// ============================
+// --------------------------------------------------
+// ground z estimator (원본 유지)
+// --------------------------------------------------
 float LidarFix::estimate_ground_z(const sensor_msgs::msg::PointCloud2::SharedPtr msg,
-                        float bin_sz, float z_min, float z_max)
+                                  float bin_sz, float z_min, float z_max)
 {
   const float d2_min = kD2Min;
   const float d2_max = kD2Max;
+
   int nbins = static_cast<int>((z_max - z_min) / bin_sz) + 1;
   if (nbins < 3) nbins = 3;
 
   std::vector<float> hist(nbins, 0.f);
   std::vector<int>   cnt (nbins, 0);
 
-  // x, y, z iteraters
   sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
   sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
   sensor_msgs::PointCloud2ConstIterator<float> iter_z(*msg, "z");
 
-  for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z)
-  {
+  for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z) {
     const float z = *iter_z;
     if (!std::isfinite(z)) continue;
     if (z < z_min || z > z_max) continue;
@@ -181,32 +261,22 @@ float LidarFix::estimate_ground_z(const sensor_msgs::msg::PointCloud2::SharedPtr
     cnt [idx] += 1;
   }
 
-  // find max hist bin
-  int max_idx = -1;
-  int max_cnt = -1;
+  int max_idx = -1, max_cnt = -1;
   for (int i = 1; i < nbins - 1; ++i) {
-    if (cnt[i] > max_cnt) {
-      max_cnt = cnt[i];
-      max_idx = i;
-    }
+    if (cnt[i] > max_cnt) { max_cnt = cnt[i]; max_idx = i; }
   }
   if (max_idx < 0 || max_cnt <= 0) return 0.f;
 
-  // Compute peak z with average of 3 bins 
-  float ground_z = (hist[max_idx] + hist[max_idx - 1] + hist[max_idx + 1]) / (cnt[max_idx] + cnt[max_idx - 1] + cnt[max_idx + 1]);
+  float ground_z = (hist[max_idx] + hist[max_idx - 1] + hist[max_idx + 1]) /
+                   (cnt [max_idx] + cnt [max_idx - 1] + cnt [max_idx + 1]);
 
-  // Verification
   int si1 = max_idx, ei1 = max_idx;
   while (si1 > 1 && (cnt[si1 - 1] <= cnt[si1])) si1--;
   while (ei1 < nbins - 1 && (cnt[ei1 + 1] <= cnt[ei1])) ei1++;
 
-  // Secondary peak (left side)
   int max_idx2 = -1, max_cnt2 = -1;
   for (int i = 1; i < si1; ++i) {
-    if (cnt[i] > max_cnt2) {
-      max_cnt2 = cnt[i];
-      max_idx2 = i;
-    }
+    if (cnt[i] > max_cnt2) { max_cnt2 = cnt[i]; max_idx2 = i; }
   }
   if (max_idx2 < 0) return ground_z;
 
@@ -214,13 +284,13 @@ float LidarFix::estimate_ground_z(const sensor_msgs::msg::PointCloud2::SharedPtr
   while (si2 > 1 && (cnt[si2 - 1] <= cnt[si2])) si2--;
   while (ei2 < si1 && (cnt[ei2 + 1] <= cnt[ei2])) ei2++;
 
-  // Compare volume
   int vol1 = 0; for (int i = si1; i <= ei1; ++i) vol1 += cnt[i];
   int vol2 = 0; for (int i = si2; i <= ei2; ++i) vol2 += cnt[i];
 
-  if (vol1 < vol2) {// If secondary peak has larger volume, compute ground_z with the peak
-	  max_idx = max_idx2;
-	  ground_z = (hist[max_idx] + hist[max_idx - 1] + hist[max_idx + 1]) / (cnt[max_idx] + cnt[max_idx - 1] + cnt[max_idx + 1]);
+  if (vol1 < vol2) {
+    int m = max_idx2;
+    ground_z = (hist[m] + hist[m - 1] + hist[m + 1]) /
+               (cnt [m] + cnt [m - 1] + cnt [m + 1]);
   }
   return ground_z;
 }
