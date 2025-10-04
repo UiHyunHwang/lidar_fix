@@ -152,12 +152,13 @@ void LidarFix::lidar_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg
 
   // field offsets
   const uint32_t step = out.point_step;
-  size_t off_x = SIZE_MAX, off_y = SIZE_MAX, off_z = SIZE_MAX, off_ring = SIZE_MAX;
+  size_t off_x = SIZE_MAX, off_y = SIZE_MAX, off_z = SIZE_MAX, off_ring = SIZE_MAX, off_intensity = SIZE_MAX;
   for (const auto& f : out.fields) {
     if      (f.name == "x") off_x = f.offset;
     else if (f.name == "y") off_y = f.offset;
     else if (f.name == "z") off_z = f.offset;
     else if (f.name == "ring") off_ring = f.offset;
+    else if (f.name == "intensity") off_intensity = f.offset;
   }
   if (off_x == SIZE_MAX || off_y == SIZE_MAX || off_z == SIZE_MAX || off_ring == SIZE_MAX) {
     pub_->publish(out);
@@ -232,8 +233,24 @@ void LidarFix::lidar_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg
         const float dr   = std::fabs(rh_q - rh);
 
         if (dz <= dz_thr(rh) && dr <= dr_thr(rh)) {
-          const float cost = dz + dr;
-          if (cost < bestCost) { bestCost = cost; mirrored = true; }
+          // check if it is a ghost point or a real under-ground-point
+          bool is_likely_reflection = true;
+          
+          if (off_intensity != SIZE_MAX) {
+            const float intensity_p = *reinterpret_cast<const float*>(sb + off + off_intensity); // 현재(z<grnd_z) 지점 반사 값
+            const float intensity_q = *reinterpret_cast<const float*>(sb + offk + off_intensity); // 대칭 지점 실제 반사 값
+
+            if (intensity_q > 1e-6) {
+              const float ratio = intensity_p / intensity_q;
+              if (ratio >= kIntensityR) {
+                is_likely_reflection = false; // 비율이 높으면 반사가 아닌 실제 물체일 가능성 높음
+              }
+            }
+          }
+          if (is_likely_reflection) {
+            const float cost = dz + dr;
+            if (cost < bestCost) { bestCost = cost; mirrored = true; }
+          }
         }
       }
     }

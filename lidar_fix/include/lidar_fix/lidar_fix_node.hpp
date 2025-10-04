@@ -27,6 +27,9 @@ inline constexpr float kDrPerMeter = 0.10f; // per-meter increment
 inline constexpr int kAzTol   = 1;  // ±1 column
 inline constexpr int kRingTol = 1;  // ±1 row
 
+// Intensity ration threshold
+inline constexpr float kIntensityR = 0.5f;
+
 // Ground-z estimation config
 inline constexpr float kGrndBinSz = 0.02f;  // 2 cm
 inline constexpr float kGrndZMin  = -1.2f;
@@ -36,7 +39,7 @@ inline constexpr float kGrndZMax  =  0.2f;
 inline constexpr float kD2Min =  1.0f * 1.0f; // r >= 1 m
 inline constexpr float kD2Max = 3.0f * 3.0f; // r <= 3 m
 
-} // namespace lidar_fix_params
+}
 
 
 class LidarFix : public rclcpp::Node {
