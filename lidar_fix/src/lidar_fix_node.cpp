@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <cmath> 
 
 using namespace lidar_fix_params;
 
@@ -26,30 +27,24 @@ LidarFix::LidarFix() : rclcpp::Node("lidar_fix_node")
     std::bind(&LidarFix::lidar_callback, this, std::placeholders::_1));
 
   pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(topic_out, 10);
+
+  el_table_.assign(kRings, 0.0f); 
 }
 
-// --------------------------------------------------
-// helpers: azimuth/elevation → (ix, iy)
-// --------------------------------------------------
+// helper function: azimuth → ix
 int LidarFix::az_to_ix(float az) const {
-  // az ∈ [-pi, pi] → [0, kCols-1]
-  float u = (az + static_cast<float>(M_PI)) / (2.0f * static_cast<float>(M_PI));
+  float u = 0.5f - az / (2.0f * static_cast<float>(M_PI)); // az ∈ [-π, π] → u ∈ [0,1]
+
+  if (u < 0.0f) u = 0.0f;
+  if (u > 1.0f) u = 1.0f;
   int ix = static_cast<int>(std::floor(u * static_cast<float>(kCols)));
-  if (ix < 0) ix = 0;
   if (ix >= kCols) ix = kCols - 1;
   return ix;
 }
-int LidarFix::el_to_iy(float el) const {
-  // el ∈ [elMin, elMax] → [0, kRings-1]
-  float u = (el - elMin) / (elMax - elMin);
-  int iy = static_cast<int>(std::round(u * static_cast<float>(kRings - 1)));
-  if (iy < 0) iy = 0;
-  if (iy >= kRings) iy = kRings - 1;
-  return iy;
-}
 
 // --------------------------------------------------
-// range image formulation (fixed size: 64 x 1024)
+// 1. range image formulation (with fixed size: 64 x 1024)
+// 2. el_table_ formulation (get iy from ring field, average ring points and save the value in el_table_)
 // --------------------------------------------------
 void LidarFix::init_index_and_radius(const sensor_msgs::msg::PointCloud2& cloud,
                                      cv::Mat& index,
@@ -66,15 +61,23 @@ void LidarFix::init_index_and_radius(const sensor_msgs::msg::PointCloud2& cloud,
   el .assign(N,  0.f);
 
   // field offsets
-  size_t off_x = 0, off_y = 0, off_z = 0;
+  size_t off_x = SIZE_MAX, off_y = SIZE_MAX, off_z = SIZE_MAX, off_ring = SIZE_MAX;
   for (const auto& f : cloud.fields) {
     if      (f.name == "x") off_x = f.offset;
     else if (f.name == "y") off_y = f.offset;
     else if (f.name == "z") off_z = f.offset;
+    else if (f.name == "ring") off_ring = f.offset;
+
   }
+  if (off_x == SIZE_MAX || off_y == SIZE_MAX || off_z == SIZE_MAX || off_ring == SIZE_MAX) return;
+
   const uint8_t* base = cloud.data.data();
   const uint32_t step = cloud.point_step;
   const size_t   all  = cloud.data.size();
+
+  // buffers for calculating mean elevation per ring
+  std::vector<double> el_sum(H,0.0);
+  std::vector<int>    el_cnt(H,0);
 
   size_t i = 0;
   for (size_t off = 0; off + step <= all; off += step, ++i) {
@@ -83,29 +86,52 @@ void LidarFix::init_index_and_radius(const sensor_msgs::msg::PointCloud2& cloud,
     const float z = *reinterpret_cast<const float*>(base + off + off_z);
     if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
 
-    const float rh  = std::hypot(x, y);
-    const float azv = std::atan2(y, x);   // [-pi, pi]
+    const float rh  = std::hypot(x, y);   // root(x^2+y^2)
+    const float pan = std::atan2(y, x);   // [-pi, pi]
     const float elv = std::atan2(z, rh);  // elevation
 
-    if (i < r_h.size()) {
-      r_h[i] = rh;
-      az [i] = pan;
-      el [i] = elv;
-    }
+    if (i < r_h.size()) {r_h[i] = rh; az [i] = pan; el [i] = elv;}
 
-    // 수직 FOV 밖은 스킵
-    if (elv < elMin || elv > elMax) continue;
+    //get ring value from pcl2 field
+    const uint16_t ring = *reinterpret_cast<const uint16_t*>(base + off + off_ring);
+    if (ring >= static_cast<uint16_t>(H)) continue;
 
-    int iy = static_cast<int>(i / static_cast<size_t>(W));
-    if (iy < 0 || iy >= H) continue;
-
-    float u = (1.0f - (pan / static_cast<float>(M_PI))) * 0.5f; 
-    int ix = static_cast<int>(std::floor(u * static_cast<float>(W)));
-    if (ix < 0)   ix = 0;
-    if (ix >= W)  ix = W - 1;
+    const int ix = az_to_ix(pan);
+    const int iy = static_cast<int>(ring);
 
     index.at<int>(iy, ix) = static_cast<int>(i);
+
+    el_sum[iy] += static_cast<double>(elv);
+    el_cnt[iy] += 1;
   }
+
+  el_table_.resize(H);
+  for (int r = 0; r < H; ++r) {
+    if (el_cnt[r] > 0) {
+      el_table_[r] = static_cast<float>(el_sum[r] / el_cnt[r]);
+    } else {
+      // 바로 옆 el_table_ 값 부여
+      el_table_[r] = (r > 0) ? el_table_[r - 1] : 0.0f;
+    }
+  }
+  // 뒤쪽에서도 보정(후방 채움) - 앞에서 0만 채워졌을 경우 대비
+  for (int r = H - 2; r >= 0; --r) {
+    if (el_cnt[r] == 0) el_table_[r] = el_table_[r + 1];
+  }
+}
+
+// --------------------------------------------------
+// allocate the closest ring number to el_sym
+// --------------------------------------------------
+int LidarFix::nearest_ring_from_el(float elv) const
+{
+  int best = 0;
+  float best_err = std::fabs(elv - el_table_[0]);
+  for (int r = 1; r < static_cast<int>(el_table_.size()); ++r) {
+    float e = std::fabs(elv - el_table_[r]);
+    if (e < best_err) { best_err = e; best = r; }
+  }
+  return best;
 }
 
 // --------------------------------------------------
@@ -113,38 +139,41 @@ void LidarFix::init_index_and_radius(const sensor_msgs::msg::PointCloud2& cloud,
 // --------------------------------------------------
 void LidarFix::lidar_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
 {
-  // 0) ground z 추정
+  // ground z estimation
   const float ground_z = estimate_ground_z(msg, kGrndBinSz, kGrndZMin, kGrndZMax);
 
-  // 1) range image (index, r_h, az, el)
+  // range image formulation (index, r_h, az, el)
   cv::Mat index;
   std::vector<float> r_h, az, el;
   init_index_and_radius(*msg, index, r_h, az, el);
 
-  // 2) 출력 메시지 준비(원본 복사)
+  // copy message for publishing
   auto out = *msg;
 
   // field offsets
   const uint32_t step = out.point_step;
-  size_t off_x = 0, off_y = 0, off_z = 0;
+  size_t off_x = SIZE_MAX, off_y = SIZE_MAX, off_z = SIZE_MAX, off_ring = SIZE_MAX;
   for (const auto& f : out.fields) {
     if      (f.name == "x") off_x = f.offset;
     else if (f.name == "y") off_y = f.offset;
     else if (f.name == "z") off_z = f.offset;
+    else if (f.name == "ring") off_ring = f.offset;
+  }
+  if (off_x == SIZE_MAX || off_y == SIZE_MAX || off_z == SIZE_MAX || off_ring == SIZE_MAX) {
+    pub_->publish(out);
+    return;
   }
 
   uint8_t*       db  = out.data.data();
   const uint8_t* sb  = msg->data.data();
   const size_t   all = out.data.size();
 
-  // skip zone around ground
-  const float skip_low  = ground_z - kSkipZone;
-  const float skip_high = ground_z + kSkipZone;
-
-  auto dz_thr = [&](float r){ return kDzBase + kDzPerMeter * r; };
+  
+  // Thresholds get bigger as r gets bigger, in order to consider the sparsity of pcl
+  auto dz_thr = [&](float r){ return kDzBase + kDzPerMeter * r; }; 
   auto dr_thr = [&](float r){ return kDrBase + kDrPerMeter * r; };
 
-  // 3) 전체 포인트 순회
+  // 3) Iterate through the pcl
   size_t i = 0;
   for (size_t off = 0; off + step <= all; off += step, ++i) {
     float& X = *reinterpret_cast<float*>(db + off + off_x);
@@ -160,34 +189,34 @@ void LidarFix::lidar_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg
       X = Y = Z = NaN; continue;
     }
 
-    // skip zone 안/위는 그대로 통과
-    if (!(z < skip_low)) { X = x; Y = y; Z = z; continue; }
+    // Check the existence of symmetric point for pcls with z < ground_z 
+    if (!(z < ground_z)) { X = x; Y = y; Z = z; continue; }
 
-    // 현재 포인트의 기본량
     const float rh  = (i < r_h.size()) ? r_h[i] : -1.f;
     const float azv = (i < az.size())  ? az[i]  :  0.f;
-    if (rh < 0.f) { X = x; Y = y; Z = z; continue; } // range image 매핑 실패
+    if (rh < 0.f) { X = x; Y = y; Z = z; continue; } 
 
-    // 목표 대칭 z
+    const uint16_t ring = *reinterpret_cast<const uint16_t*>(sb + off + off_ring);
+    if (ring >= static_cast<uint16_t>(kRings)) { X = x; Y = y; Z = z; continue; }
+
+    // Infer (ix, iy) of the symmetric point
     const float z_sym = 2.f * ground_z - z;
-
-    // 목표 고도각/인덱스
     const float el_sym = std::atan2(z_sym, rh);
-    int ix = az_to_ix(azv);
-    int iy = el_to_iy(el_sym);
+    const int   ix = az_to_ix(azv);
+    const int   iy_tgt = nearest_ring_from_el(el_sym);
 
-    // 3×3 근방 탐색
+    // Search 3×3 points near the predicted point (ix, iy) (kAzTol = 3)
     const int xs = std::max(0, ix - kAzTol);
     const int xe = std::min(kCols - 1, ix + kAzTol);
-    const int ys = std::max(0, iy - kRingTol);
-    const int ye = std::min(kRings - 1, iy + kRingTol);
+    const int ys = std::max(0, iy_tgt - kRingTol);
+    const int ye = std::min(kRings - 1, iy_tgt + kRingTol);
 
     bool mirrored = false;
     float bestCost = 1e9f;
 
     for (int cx = xs; cx <= xe; ++cx) {
       for (int cy = ys; cy <= ye; ++cy) {
-        int k = index.at<int>(cy, cx);
+        const int k = index.at<int>(cy, cx);
         if (k < 0) continue;
 
         const size_t offk = static_cast<size_t>(k) * step;
@@ -210,13 +239,11 @@ void LidarFix::lidar_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg
     }
 
     if (mirrored) {
-      // 복원: 원점 방사 스케일로 z=ground_z
       const float ratio = (z == 0.f) ? 1.f : (ground_z / z);
       X = x * ratio;
       Y = y * ratio;
       Z = ground_z;
     } else {
-      // 미복원
       X = x; Y = y; Z = z;
     }
   }

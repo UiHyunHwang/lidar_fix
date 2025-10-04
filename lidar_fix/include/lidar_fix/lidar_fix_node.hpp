@@ -13,18 +13,15 @@ namespace lidar_fix_params {
 inline constexpr int   kRings = 64;     // H
 inline constexpr int   kCols  = 1024;   // W
 
-// Elevation range [rad] (adjust to your LiDAR)
+// Elevation range [rad] (adjust to your LiDAR, default value set for OS1)
 inline constexpr float elMin = -static_cast<float>(M_PI)/8.0f;
 inline constexpr float elMax =  +static_cast<float>(M_PI)/8.0f;
 
-// Skip zone around ground [m]
-inline constexpr float kSkipZone = 0.01f;  // 1 cm
-
 // Symmetry match thresholds (distance-adaptive)
-inline constexpr float kDzBase     = 0.05f; // base z tol (m)
-inline constexpr float kDzPerMeter = 0.01f; // per-meter increment
-inline constexpr float kDrBase     = 0.10f; // base r_h tol (m)
-inline constexpr float kDrPerMeter = 0.01f; // per-meter increment
+inline constexpr float kDzBase     = 0.03f; // base z tol (m)
+inline constexpr float kDzPerMeter = 0.05f; // per-meter increment
+inline constexpr float kDrBase     = 0.03f; // base r_h tol (m)
+inline constexpr float kDrPerMeter = 0.10f; // per-meter increment
 
 // Neighborhood search (ix, iy)
 inline constexpr int kAzTol   = 1;  // ±1 column
@@ -37,7 +34,7 @@ inline constexpr float kGrndZMax  =  0.2f;
 
 // Ground-z estimation range gates (r^2)
 inline constexpr float kD2Min =  1.0f * 1.0f; // r >= 1 m
-inline constexpr float kD2Max = 30.0f * 30.0f; // r <= 30 m
+inline constexpr float kD2Max = 3.0f * 3.0f; // r <= 3 m
 
 } // namespace lidar_fix_params
 
@@ -67,5 +64,7 @@ private:
 
   // angle → index helpers
   inline int az_to_ix(float az) const; // [-pi, pi] → [0, kCols-1]
-  inline int el_to_iy(float el) const; // [elMin, elMax] → [0, kRings-1]
+
+  int  nearest_ring_from_el(float elv) const;   // el → closest ring
+  std::vector<float> el_table_;                 // size: kRings, filled in init_index_and_radius()
 };
